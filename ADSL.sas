@@ -1,4 +1,6 @@
-/* Step 1: Import SDTM DM data */
+/* ------------------------ */
+/* Step 1: Import DM & AE  */
+/* ------------------------ */
 PROC IMPORT OUT= WORK.SDTM_DM
             DATAFILE= "C:\path\to\raw_dm_data_hypertension.xlsx"
             DBMS=EXCEL REPLACE;
@@ -6,7 +8,6 @@ PROC IMPORT OUT= WORK.SDTM_DM
      GETNAMES=YES;
 RUN;
 
-/* Step 2: Import SDTM AE data */
 PROC IMPORT OUT= WORK.SDTM_AE
             DATAFILE= "C:\path\to\raw_ae_data_hypertension.xlsx"
             DBMS=EXCEL REPLACE;
@@ -14,23 +15,30 @@ PROC IMPORT OUT= WORK.SDTM_AE
      GETNAMES=YES;
 RUN;
 
-/* Step 3: Simulate SDTM EX dataset if not available */
+/* --------------------------------- */
+/* Step 2: Simulate SDTM_EX Dataset */
+/* --------------------------------- */
 DATA WORK.SDTM_EX;
     SET WORK.SDTM_DM (KEEP=USUBJID RFSTDTC);
-    EXTRT = "Drug"; /* Mock planned treatment */
+
+    /* Simulate random treatment */
+    IF MOD(_N_, 2) = 0 THEN EXTRT = "Drug";
+    ELSE EXTRT = "Placebo";
+
     EXSTDTC = INPUT(RFSTDTC, ANYDTDTM.);
-    EXENDTC = INTNX('DAY', EXSTDTC, 28); /* Assume 28-day treatment period */
+
+    /* 28-day treatment window */
+    IF NOT MISSING(EXSTDTC) THEN EXENDTC = EXSTDTC + 28*86400;
+    ELSE EXENDTC = .;
+
     FORMAT EXSTDTC EXENDTC DATETIME20.;
 RUN;
 
-/* Step 4: Merge DM and EX datasets */
-PROC SORT DATA=WORK.SDTM_DM;
-    BY USUBJID;
-RUN;
-
-PROC SORT DATA=WORK.SDTM_EX;
-    BY USUBJID;
-RUN;
+/* -------------------------- */
+/* Step 3: Merge DM and EX   */
+/* -------------------------- */
+PROC SORT DATA=WORK.SDTM_DM; BY USUBJID; RUN;
+PROC SORT DATA=WORK.SDTM_EX; BY USUBJID; RUN;
 
 DATA WORK.DM_EX_MERGE;
     MERGE WORK.SDTM_DM (IN=A)
@@ -39,7 +47,8 @@ DATA WORK.DM_EX_MERGE;
 
     IF A;
 
-    /* Derive TRTP and TRTPN */
+    /* Treatment Variables */
+    LENGTH TRTP TRTA $50;
     IF EXTRT IN ("Placebo", "PBO") THEN DO;
         TRTP = "Placebo";
         TRTPN = 1;
@@ -53,88 +62,90 @@ DATA WORK.DM_EX_MERGE;
         TRTPN = 3;
     END;
 
-    /* Actual Treatment Same as Planned */
-    TRTA = TRTP;
+    TRTA  = TRTP;
     TRTAN = TRTPN;
 
-    KEEP USUBJID STUDYID SITEID SEX RACE ETHNIC AGE ARMCD ARM ACTARMCD ACTARM COUNTRY TRTP TRTPN TRTA TRTAN EXSTDTC EXENDTC;
+    KEEP USUBJID STUDYID SITEID SEX RACE ETHNIC AGE ARMCD ARM ACTARMCD ACTARM COUNTRY
+         TRTP TRTPN TRTA TRTAN EXSTDTC EXENDTC;
 RUN;
 
-/* Step 5: Derive AE Flags */
-PROC SUMMARY DATA=WORK.SDTM_AE NWAY;
-    CLASS USUBJID;
-    VAR AESER;
-    OUTPUT OUT=WORK.AE_SUMMARY (DROP=_TYPE_ _FREQ_)
-           MAX(AESER) = AESER_MAX;
-RUN;
+/* ---------------------------------- */
+/* Step 4: Derive Serious AE Flag    */
+/* ---------------------------------- */
+PROC SQL;
+    CREATE TABLE WORK.AE_FLAGS AS
+    SELECT USUBJID,
+           MAX(CASE WHEN AESER = "Y" THEN 1 ELSE 0 END) AS SERIOUS_AE_FLAG
+    FROM WORK.SDTM_AE
+    GROUP BY USUBJID;
+QUIT;
 
 DATA WORK.AE_FLAGS;
-    SET WORK.AE_SUMMARY;
-    IF AESER_MAX = "Y" THEN AESER_FLAG = "Y";
-    ELSE AESER_FLAG = "N";
+    SET WORK.AE_FLAGS;
+    LENGTH AESER_FLAG $1;
+    AESER_FLAG = IFC(SERIOUS_AE_FLAG = 1, "Y", "N");
+    DROP SERIOUS_AE_FLAG;
 RUN;
 
-/* Step 6: Merge with AE flags */
-PROC SORT DATA=WORK.DM_EX_MERGE;
-    BY USUBJID;
-RUN;
-
-PROC SORT DATA=WORK.AE_FLAGS;
-    BY USUBJID;
-RUN;
+/* ----------------------------- */
+/* Step 5: Build ADSL Dataset   */
+/* ----------------------------- */
+PROC SORT DATA=WORK.DM_EX_MERGE; BY USUBJID; RUN;
+PROC SORT DATA=WORK.AE_FLAGS; BY USUBJID; RUN;
 
 DATA WORK.ADSL;
     MERGE WORK.DM_EX_MERGE (IN=A)
-          WORK.AE_FLAGS (IN=B);
+          WORK.AE_FLAGS     (IN=B);
     BY USUBJID;
-
     IF A;
 
     /* Safety Population Flag */
-    SAFFL = "Y";
+    SAFFL = "Y"; /* Include all subjects for now */
 
-    /* Derived from EX */
+    /* Treatment Dates & Duration */
     TRTSDT = DATEPART(EXSTDTC);
     TRTEDT = DATEPART(EXENDTC);
     FORMAT TRTSDT TRTEDT MMDDYY10.;
 
-    /* Duration of Treatment in Days */
-    TRTDUR = TRTEDT - TRTSDT + 1;
+    IF NOT MISSING(TRTSDT) AND NOT MISSING(TRTEDT) THEN
+        TRTDUR = TRTEDT - TRTSDT + 1;
+    ELSE TRTDUR = .;
 
-    /* Optional Variables */
-    RANDFL = "N"; /* Not randomized */
-    DS_AVAL = ""; /* Placeholder for disposition status */
+    /* Other Optional Variables */
+    RANDFL = "N";  /* Assume not randomized in mock project */
+    DS_AVAL = "";  /* Placeholder for disposition status */
 
-    /* Keep only relevant variables */
     KEEP USUBJID STUDYID SITEID SEX RACE ETHNIC AGE ARMCD ARM ACTARMCD ACTARM COUNTRY
          TRTP TRTPN TRTA TRTAN TRTSDT TRTEDT TRTDUR SAFFL AESER_FLAG RANDFL DS_AVAL;
 RUN;
 
-/* Step 7: Label and format variables */
-PROC DATASETS LIBRARY=WORK;
+/* ----------------------------------- */
+/* Step 6: Add Labels and Descriptions */
+/* ----------------------------------- */
+PROC DATASETS LIBRARY=WORK NOLIST;
     MODIFY ADSL;
     LABEL
-        USUBJID = 'Unique Subject Identifier'
-        STUDYID = 'Study Identifier'
-        SITEID = 'Study Site Identifier'
-        SEX = 'Sex'
-        RACE = 'Race'
-        ETHNIC = 'Ethnicity'
-        AGE = 'Age at Informed Consent'
-        ARMCD = 'Planned Arm Code'
-        ARM = 'Description of Planned Arm'
-        ACTARMCD = 'Actual Arm Code'
-        ACTARM = 'Description of Actual Arm'
-        COUNTRY = 'Country'
-        TRTP = 'Planned Treatment'
-        TRTPN = 'Planned Treatment (Numeric)'
-        TRTA = 'Actual Treatment'
-        TRTAN = 'Actual Treatment (Numeric)'
-        TRTSDT = 'Date of First Exposure to Treatment'
-        TRTEDT = 'Date of Last Exposure to Treatment'
-        TRTDUR = 'Duration of Treatment (Days)'
-        SAFFL = 'Safety Population Flag'
-        AESER_FLAG = 'Any Serious Adverse Event'
-        RANDFL = 'Randomized Flag'
-        DS_AVAL = 'Disposition Status';
-RUN;
+        USUBJID     = 'Unique Subject Identifier'
+        STUDYID     = 'Study Identifier'
+        SITEID      = 'Study Site Identifier'
+        SEX         = 'Sex'
+        RACE        = 'Race'
+        ETHNIC      = 'Ethnicity'
+        AGE         = 'Age at Informed Consent'
+        ARMCD       = 'Planned Arm Code'
+        ARM         = 'Planned Arm Description'
+        ACTARMCD    = 'Actual Arm Code'
+        ACTARM      = 'Actual Arm Description'
+        COUNTRY     = 'Country'
+        TRTP        = 'Planned Treatment'
+        TRTPN       = 'Numeric Planned Treatment'
+        TRTA        = 'Actual Treatment'
+        TRTAN       = 'Numeric Actual Treatment'
+        TRTSDT      = 'Date of First Dose'
+        TRTEDT      = 'Date of Last Dose'
+        TRTDUR      = 'Duration of Treatment (Days)'
+        SAFFL       = 'Safety Population Flag'
+        AESER_FLAG  = 'Serious Adverse Event (Any)'
+        RANDFL      = 'Randomized Population Flag'
+        DS_AVAL     = 'Disposition Status';
+QUIT;
