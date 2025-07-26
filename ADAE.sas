@@ -1,4 +1,4 @@
-/* Step 1: Import SDTM datasets */
+/* Step 1: Import SDTM Datasets */
 PROC IMPORT OUT= WORK.SDTM_DM
             DATAFILE= "C:\path\to\raw_dm_data_hypertension.xlsx"
             DBMS=EXCEL REPLACE;
@@ -13,70 +13,74 @@ PROC IMPORT OUT= WORK.SDTM_AE
      GETNAMES=YES;
 RUN;
 
-/* Step 2: Create dummy SDTM_EX dataset if not available */
+/* Step 2: Create Mock SDTM_EX Dataset */
 DATA WORK.SDTM_EX;
     SET WORK.SDTM_DM (KEEP=USUBJID RFSTDTC);
-    EXTRTP = "Drug"; /* Mock planned treatment */
-    EXSTDTC = RFSTDTC; /* Assume first dose is reference start date */
-    EXENDTC = INTNX('DAY', EXSTDTC, 28); /* Assume 28-day treatment period */
+    
+    /* Randomly assign treatment */
+    IF MOD(_N_, 2) = 0 THEN EXTRTP = "Drug";
+    ELSE EXTRTP = "Placebo";
+
+    /* Set start date from RFSTDTC */
+    EXSTDTC = INPUT(RFSTDTC, ANYDTDTM.);
+    
+    /* Add 28 days for treatment duration */
+    IF NOT MISSING(EXSTDTC) THEN EXENDTC = EXSTDTC + 28*86400;
+    
     FORMAT EXSTDTC EXENDTC DATETIME20.;
 RUN;
 
-/* Step 3: Merge DM, AE, and EX datasets */
-PROC SORT DATA=WORK.SDTM_DM;
-    BY USUBJID;
-RUN;
+/* Step 3: Sort Datasets for Merge */
+PROC SORT DATA=WORK.SDTM_DM; BY USUBJID; RUN;
+PROC SORT DATA=WORK.SDTM_AE; BY USUBJID; RUN;
+PROC SORT DATA=WORK.SDTM_EX; BY USUBJID; RUN;
 
-PROC SORT DATA=WORK.SDTM_AE;
-    BY USUBJID;
-RUN;
-
-PROC SORT DATA=WORK.SDTM_EX;
-    BY USUBJID;
-RUN;
-
+/* Step 4: Merge DM, AE, and EX */
 DATA WORK.AE_MERGE;
     MERGE WORK.SDTM_AE (IN=A)
           WORK.SDTM_EX (IN=B)
           WORK.SDTM_DM (IN=C KEEP=USUBJID AGE SEX);
     BY USUBJID;
+    
+    IF A; /* Keep only AE records */
 
-    IF A;
-
-    /* Keep only relevant variables */
+    /* Keep relevant variables */
     KEEP USUBJID STUDYID AETERM AESTDTC AEENDTC AESEV AESER AEREL AEOUT
          EXTRTP EXSTDTC EXENDTC AGE SEX;
 RUN;
 
-/* Step 4: Derive ADaM variables */
+/* Step 5: Derive ADaM ADAE Dataset */
 DATA WORK.ADAE;
     SET WORK.AE_MERGE;
 
-    /* ADaM Identifier Variables */
-    LENGTH USUBJID $50 TRTP TRTA $200;
+    /* ADaM Treatment Variables */
+    LENGTH TRTP TRTA $200 USUBJID $50 AEBODSYS $100 SERIOUS $5;
 
-    USUBJID = USUBJID;
     TRTP = EXTRTP;
     TRTA = EXTRTP;
 
-    /* Map numeric treatment group */
+    /* Numeric Treatment */
     IF TRTP = "Placebo" THEN TRTPN = 1;
     ELSE IF TRTP = "Drug" THEN TRTPN = 2;
 
-    /* AE Topic Variables */
-    AEBODSYS = ""; /* Not provided in raw data - map from dictionary if available */
+    /* Map AEBODSYS (mocked as example) */
+    IF INDEX(UPCASE(AETERM), "HEADACHE") THEN AEBODSYS = "Nervous System Disorders";
+    ELSE IF INDEX(UPCASE(AETERM), "RASH") THEN AEBODSYS = "Skin and Subcutaneous Tissue Disorders";
+    ELSE AEBODSYS = "General Disorders";
+
+    /* Severity, Seriousness, Relationship */
     AETERM = AETERM;
     AESEV = AESEV;
     AESER = AESER;
     AEREL = AEREL;
     AVALC = AEOUT;
 
-    /* Timing Variables */
+    /* Convert dates to datetime */
     ASTDT = INPUT(AESTDTC, ANYDTDTM.);
     AENDT = INPUT(AEENDTC, ANYDTDTM.);
     FORMAT ASTDT AENDT DATETIME20.;
 
-    /* Compute Study Days */
+    /* Derive Study Day Variables */
     IF NOT MISSING(ASTDT) AND NOT MISSING(EXSTDTC) THEN DO;
         ASTDY = CEIL((ASTDT - EXSTDTC)/86400);
         IF ASTDT >= EXSTDTC THEN ASTDY = ASTDY + 1;
@@ -87,26 +91,30 @@ DATA WORK.ADAE;
         IF AENDT >= EXSTDTC THEN AENDY = AENDY + 1;
     END;
 
-    /* Param Code */
-    PARAMCD = "AE";
-
-    /* Optional Flags */
+    /* Flag Serious Events */
     IF AESER = "Y" THEN SERIOUS = "Yes";
     ELSE SERIOUS = "No";
 
-    /* Final Keep Statement */
+    /* Assign Parameter Code */
+    PARAMCD = "AE";
+
+    /* Warning for missing dates */
+    IF MISSING(EXSTDTC) THEN PUT "WARNING: Missing EXSTDTC for " USUBJID;
+    IF MISSING(AESTDTC) THEN PUT "WARNING: Missing AESTDTC for " USUBJID;
+
+    /* Final Keep */
     KEEP USUBJID TRTP TRTA TRTPN AEBODSYS AETERM AESEV AESER AEREL AVALC
-         ASTDT ASTDY AENDT AENDY PARAMCD AGE SEX;
+         ASTDT ASTDY AENDT AENDY PARAMCD AGE SEX SERIOUS;
 RUN;
 
-/* Step 5: Label and Format ADaM Variables */
-PROC DATASETS LIBRARY=WORK;
+/* Step 6: Label Variables */
+PROC DATASETS LIBRARY=WORK NOLIST;
     MODIFY ADAE;
     LABEL
         USUBJID = 'Unique Subject Identifier'
         TRTP = 'Planned Treatment'
         TRTA = 'Actual Treatment'
-        TRTPN = 'Numeric Version of Planned Treatment'
+        TRTPN = 'Numeric Treatment Code'
         AEBODSYS = 'Body System or Organ Class'
         AETERM = 'Adverse Event Term'
         AESEV = 'Severity'
@@ -119,5 +127,6 @@ PROC DATASETS LIBRARY=WORK;
         AENDY = 'End Day Relative to First Dose'
         PARAMCD = 'Parameter Code'
         AGE = 'Age at Informed Consent'
-        SEX = 'Sex';
-RUN;
+        SEX = 'Sex'
+        SERIOUS = 'Serious Event Flag';
+QUIT;
