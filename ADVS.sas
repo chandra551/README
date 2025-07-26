@@ -1,4 +1,6 @@
-/* Step 1: Simulate SDTM_VS dataset if not available */
+/* --------------------------- */
+/* Step 1: Simulated SDTM_VS  */
+/* --------------------------- */
 DATA WORK.SDTM_VS;
     INFILE DATALINES DLM=",";
 
@@ -16,111 +18,127 @@ HTN001-001-002,PULSE,Heart Rate,80,bpm,80,80,15JAN2024:00:00,15
 ;
 RUN;
 
-/* Step 2: Sort by subject and test */
-PROC SORT DATA=WORK.SDTM_VS;
-    BY USUBJID VSTEST VISITNUM;
+/* ------------------------------- */
+/* Step 2: Sort by subject & test  */
+/* ------------------------------- */
+PROC SORT DATA=WORK.SDTM_VS; 
+    BY USUBJID VSTESTCD VSDTC; 
 RUN;
 
-/* Step 3: Get baseline values (visit = 1) */
-DATA BASELINE;
+/* -------------------------------------- */
+/* Step 3: Get Baseline per Subject/Test  */
+/* -------------------------------------- */
+DATA WORK.BASELINE;
     SET WORK.SDTM_VS;
-    IF VISITNUM = 1;
-    RENAME VSSTRESN = BASE;
-    KEEP USUBJID VSTEST BASE;
+    BY USUBJID VSTESTCD;
+
+    IF FIRST.VSTESTCD THEN DO;
+        BASE = VSSTRESN;
+        OUTPUT;
+    END;
+    KEEP USUBJID VSTESTCD BASE;
 RUN;
 
-/* Step 4: Merge baseline with all visits */
-PROC SORT DATA=BASELINE;
-    BY USUBJID VSTEST;
+/* ------------------------------ */
+/* Step 4: Merge Baseline to VS   */
+/* ------------------------------ */
+PROC SORT DATA=WORK.BASELINE; 
+    BY USUBJID VSTESTCD; 
 RUN;
 
 DATA WORK.VS_MERGE;
     MERGE WORK.SDTM_VS (IN=A)
-          BASELINE (IN=B);
-    BY USUBJID VSTEST;
+          WORK.BASELINE (IN=B);
+    BY USUBJID VSTESTCD;
     IF A;
 RUN;
 
-/* Step 5: Derive ADVS variables */
-DATA WORK.ADV;
+/* ----------------------------------------- */
+/* Step 5: Derive ADVS (Analysis Dataset)    */
+/* ----------------------------------------- */
+DATA WORK.ADVS;
+    LENGTH PARAMCD $20 VSPARCAT VSCAT $50 TRTP TRTA $20;
+
+    /* Load RFSTDTC from DM via hash */
+    IF _N_ = 1 THEN DO;
+        DECLARE HASH h(dataset: "WORK.SDTM_DM");
+        h.defineKey("USUBJID");
+        h.defineData("RFSTDTC");
+        h.defineDone();
+    END;
+
     SET WORK.VS_MERGE;
 
-    /* Identifier Variables */
-    LENGTH USUBJID $50 PARAMCD $200;
-
-    USUBJID = USUBJID;
-    PARAMCD = UPCASE(VSTESTCD);
-
-    /* Result Variables */
-    AVAL = VSSTRESN;
-
-    /* Timing Variables */
-    ADT = INPUT(VSDTC, ANYDTDTM.);
-    FORMAT ADT DATETIME20.;
-
-    /* Study Day Calculation (requires DM domain RFSTDTC) */
-    IF _N_ = 1 THEN DO;
-        DECLARE HASH h(dataset: 'WORK.SDTM_DM');
-        h.defineKey('USUBJID');
-        h.defineData('RFSTDTC');
-        h.defineDone();
-        CALL MISSING(RFSTDTC);
-    END;
-
+    /* Get reference start date */
     rc = h.find();
+    RFSTDTC_DT = INPUT(RFSTDTC, ANYDTDTM.);
 
-    IF NOT MISSING(ADT) AND NOT MISSING(RFSTDTC) THEN
-        ADY = CEIL((ADT - RFSTDTC)/86400); /* seconds/day */
+    /* Identifier variables */
+    PARAMCD = UPCASE(VSTESTCD);
+    AVAL = VSSTRESN;
+    ADT = VSDTC;
+
+    /* Study Day */
+    IF NOT MISSING(ADT) AND NOT MISSING(RFSTDTC_DT) THEN DO;
+        ADY = CEIL((ADT - RFSTDTC_DT) / 86400);
+        IF ADT >= RFSTDTC_DT THEN ADY + 1;
+    END;
     ELSE ADY = .;
 
-    /* Change from Baseline */
+    /* Change from baseline */
     CHG = AVAL - BASE;
-
-    /* Percent Change */
-    IF BASE NE 0 THEN PCHG = (CHG / BASE) * 100;
+    IF BASE NE . AND BASE NE 0 THEN PCHG = (CHG / BASE) * 100;
     ELSE PCHG = .;
 
-    /* Category Mapping */
-    IF INDEX("SYSBP DIABP", PARAMCD) THEN DO;
-        VSPARCAT = "Blood Pressure";
-        VSCAT = "Cardiovascular";
-    END;
-    ELSE IF INDEX("PULSE RESPIRATION", PARAMCD) THEN DO;
-        VSPARCAT = "Heart Rate";
-        VSCAT = "Cardiovascular";
-    END;
-    ELSE IF INDEX("TEMPERATURE", PARAMCD) THEN DO;
-        VSPARCAT = "Temperature";
-        VSCAT = "General";
-    END;
-    ELSE DO;
-        VSPARCAT = "Other";
-        VSCAT = "Other";
+    /* Treatment group simulation (real would use EX or DM/ARMCD) */
+    IF MOD(_N_, 2) = 0 THEN DO; TRTP = "Drug"; TRTA = "Drug"; END;
+    ELSE DO; TRTP = "Placebo"; TRTA = "Placebo"; END;
+
+    /* Vital sign categorization */
+    SELECT (PARAMCD);
+        WHEN ("SYSBP", "DIABP") DO;
+            VSPARCAT = "Blood Pressure";
+            VSCAT = "Cardiovascular";
+        END;
+        WHEN ("PULSE", "RESP") DO;
+            VSPARCAT = "Heart Rate";
+            VSCAT = "Cardiovascular";
+        END;
+        WHEN ("TEMP") DO;
+            VSPARCAT = "Temperature";
+            VSCAT = "General";
+        END;
+        OTHERWISE DO;
+            VSPARCAT = "Other";
+            VSCAT = "Other";
+        END;
     END;
 
-    /* Keep only relevant variables */
+    /* Final keep */
     KEEP USUBJID TRTP TRTA PARAMCD AVAL ADT ADY BASE CHG PCHG
          VSPARCAT VSCAT VSTEST VSORRESU VSSTRESN VSSTRESC;
 RUN;
 
-/* Step 6: Label and format variables */
-PROC DATASETS LIBRARY=WORK;
-    MODIFY ADV;
+/* --------------------------------------- */
+/* Step 6: Label and Format ADVS Dataset   */
+/* --------------------------------------- */
+PROC DATASETS LIBRARY=WORK NOLIST;
+    MODIFY ADVS;
     LABEL
-        USUBJID = 'Unique Subject Identifier'
-        TRTP = 'Planned Treatment'
-        TRTA = 'Actual Treatment'
-        PARAMCD = 'Parameter Code'
-        AVAL = 'Numeric Vital Sign Result'
-        ADT = 'Analysis Date'
-        ADY = 'Study Day'
-        BASE = 'Baseline Value'
-        CHG = 'Change from Baseline'
-        PCHG = 'Percent Change from Baseline'
-        VSPARCAT = 'Parent Category'
-        VSCAT = 'Category'
-        VSTEST = 'Test Name'
-        VSORRESU = 'Units'
-        VSSTRESN = 'Numeric Result'
-        VSSTRESC = 'Standardized Result';
-RUN;
+        USUBJID   = "Unique Subject Identifier"
+        TRTP      = "Planned Treatment"
+        TRTA      = "Actual Treatment"
+        PARAMCD   = "Vital Signs Parameter Code"
+        AVAL      = "Numeric Result (Standardized)"
+        ADT       = "Date of Measurement"
+        ADY       = "Study Day"
+        BASE      = "Baseline Value"
+        CHG       = "Change from Baseline"
+        PCHG      = "Percent Change from Baseline"
+        VSPARCAT  = "Vital Signs Parent Category"
+        VSCAT     = "Vital Signs Category"
+        VSTEST    = "Vital Signs Test Name"
+        VSORRESU  = "Original Result Units"
+        VSSTRESN  = "Standardized Numeric Result"
+        VSSTRESC  = "Standardized Character Result";
+QUIT;
